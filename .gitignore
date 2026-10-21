@@ -3,3 +3,16 @@ __pycache__/
 *.pyo
 __pycache__/
 *.pyc
+ckpts/
+outputs/
+logs/
+infer/outputs/
+infer/logs/
+*.egg-info/
+dataset_avatars/
+first_frames/
+results_v2/
+compare/
+motion_25fps.mp4
+results_v*/**/*.mp4
+results_v*/**/*.png

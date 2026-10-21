@@ -368,6 +368,11 @@ class Encoder3d(nn.Module):
         )
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        return self.forward_up(self.forward_down(x, feat_cache, feat_idx), feat_cache, feat_idx)
+
+    # forward_down (conv1 + downsampling stages) only mixes spatial neighbours, so it can
+    # run on column strips (with a halo); forward_up holds the frame-global attention.
+    def forward_down(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -392,7 +397,9 @@ class Encoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+        return x
 
+    def forward_up(self, x, feat_cache=None, feat_idx=[0]):
         ## middle
         for layer in self.middle:
             if isinstance(layer, ResidualBlock) and feat_cache is not None:
@@ -485,6 +492,12 @@ class Decoder3d(nn.Module):
         )
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        return self.forward_post(self.forward_pre(x, feat_cache, feat_idx), feat_cache, feat_idx)
+
+    # forward_pre (conv1 + middle) holds the frame-global attention at latent resolution;
+    # forward_post (upsampling stages + head) only mixes spatial neighbours, so it can run
+    # on column strips (with a halo) on different GPUs.
+    def forward_pre(self, x, feat_cache=None, feat_idx=[0]):
         ## conv1
         if feat_cache is not None:
             idx = feat_idx[0]
@@ -510,7 +523,9 @@ class Decoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+        return x
 
+    def forward_post(self, x, feat_cache=None, feat_idx=[0]):
         ## upsamples
         for layer in self.upsamples:
             if feat_cache is not None:
@@ -657,6 +672,55 @@ class VideoVAE_(nn.Module):
                 out = torch.cat([out, out_], 2)
         return out
 
+    def decode_cols(self, z, scale, c0, c1, halo=16):
+        """Pixel columns [8*c0, 8*c1) of decode(z), computing only latent columns
+        [c0 - halo, c1 + halo) in the (spatially local) upsampling stages. The
+        frame-global middle block still runs on the full latent width. Outputs
+        are exact as long as `halo` covers the receptive field of the upsampling
+        stages."""
+        self.clear_cache()
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1
+            )
+        else:
+            z = z / scale[1] + scale[0]
+        a, b = max(c0 - halo, 0), min(c1 + halo, z.shape[-1])
+        x = self.conv2(z)
+        out = []
+        for i in range(z.shape[2]):
+            self._conv_idx = [0]
+            h = self.decoder.forward_pre(x[:, :, i : i + 1], self._feat_map, self._conv_idx)
+            h = self.decoder.forward_post(h[..., a:b], self._feat_map, self._conv_idx)
+            out.append(h[..., 8 * (c0 - a) : 8 * (c1 - a)])
+        return torch.cat(out, 2)
+
+    def encode_cols(self, x, scale, c0, c1, gather, halo=16):
+        """encode(x) with the downsampling stages run only on input columns
+        [8*(c0 - halo), 8*(c1 + halo)). `gather` assembles the latent-resolution
+        columns [c0, c1) of all participants into the full width (e.g. an
+        all_gather across ranks) before the frame-global middle block."""
+        self.clear_cache()
+        a, b = max(c0 - halo, 0), min(c1 + halo, x.shape[-1] // 8)
+        x = x[..., 8 * a : 8 * b]
+        t = x.shape[2]
+        out = []
+        for i in range(1 + (t - 1) // 4):
+            self._enc_conv_idx = [0]
+            chunk = x[:, :, :1] if i == 0 else x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
+            h = self.encoder.forward_down(chunk, self._enc_feat_map, self._enc_conv_idx)
+            h = gather(h[..., c0 - a : c1 - a].contiguous())
+            out.append(self.encoder.forward_up(h, self._enc_feat_map, self._enc_conv_idx))
+        out = torch.cat(out, 2)
+        mu, log_var = self.conv1(out).chunk(2, dim=1)
+        if isinstance(scale[0], torch.Tensor):
+            mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
+                1, self.z_dim, 1, 1, 1
+            )
+        else:
+            mu = (mu - scale[0]) * scale[1]
+        return mu
+
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
@@ -777,17 +841,34 @@ class VideoVAE:
         videos: A list of videos each with shape [C, T, H, W].
         """
         # with amp.autocast(dtype=self.dtype):
-        return [
+        out = [
             self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
             for u in videos
         ]
+        # the causal feature cache of the last chunk stays allocated otherwise (~5 GB at 1080p)
+        self.model.clear_cache()
+        return out
 
     def decode(self, zs):
         # with amp.autocast(dtype=self.dtype):
-        return [
+        out = [
             self.model.decode(u.unsqueeze(0), self.scale)
             .float()
             .clamp_(-1, 1)
             .squeeze(0)
             for u in zs
         ]
+        self.model.clear_cache()
+        return out
+
+    def decode_cols(self, z, c0, c1, halo=16):
+        """Columns [8*c0, 8*c1) of decode([z])[0]; z: [C, T, H, W]."""
+        out = self.model.decode_cols(z.unsqueeze(0), self.scale, c0, c1, halo).float().clamp_(-1, 1).squeeze(0)
+        self.model.clear_cache()
+        return out
+
+    def encode_cols(self, video, c0, c1, gather, halo=16):
+        """encode([video])[0] computed cooperatively; see VideoVAE_.encode_cols."""
+        out = self.model.encode_cols(video.unsqueeze(0), self.scale, c0, c1, gather, halo).float().squeeze(0)
+        self.model.clear_cache()
+        return out

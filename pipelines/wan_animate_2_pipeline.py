@@ -4,6 +4,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import math
 import inspect
 import random
+import subprocess
 import time
 import traceback
 from datetime import timedelta
@@ -24,6 +25,7 @@ except:
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
@@ -43,6 +45,7 @@ from wanxiang.distributed.fsdp import shard_model, shard_transformer
 from pipelines.utils.multiclip_utils import zigzag_padding, get_padding_len
 from pipelines.utils.human_video_omni_utils import resize_by_area, get_frame_indices
 from pipelines.utils.utils import ffmpeg_extract_audio_by_fps, merge_video_audio, get_video_duration
+from pipelines.utils.color_utils import lab_mean, anchor_window_color, person_mask, person_stats, anchor_person, region_stats, anchor_regions
 from safetensors import safe_open
 
 
@@ -131,6 +134,51 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def write_video(frames, path, fps, crf=10):
+    """Encode RGB uint8 frames (T, H, W, 3) near-losslessly with libx264.
+
+    moviepy's defaults produce ~0.5 Mbps at 720P, which bakes compression
+    artifacts into the output before any upscaling. Odd dimensions (possible
+    after padding removal) are cropped by one pixel for yuv420p.
+    """
+    frames = frames[:, : frames.shape[1] // 2 * 2, : frames.shape[2] // 2 * 2]
+    t, h, w, _ = frames.shape
+    proc = subprocess.Popen(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", path,
+        ],
+        stdin=subprocess.PIPE,
+    )
+    proc.stdin.write(np.ascontiguousarray(frames).tobytes())
+    proc.stdin.close()
+    if proc.wait() != 0:
+        raise RuntimeError(f"ffmpeg failed writing {path}")
+
+
+# v4 (WAN_SPLIT_VAE=1): the per-window VAE work (encoding the continuity frame, decoding
+# the window) is split into column strips, one per rank, instead of being repeated on
+# every rank. Strips are computed with a halo of VAE_HALO latent columns, which covers
+# the receptive field of the spatially-local VAE stages (outputs agree with the
+# full-frame pass up to bf16 rounding, ~1/255 on a few percent of pixels).
+VAE_HALO = 12
+
+
+def _col_bounds(width, world):
+    return [round(width * r / world) for r in range(world + 1)]
+
+
+def _gather_cols(t, bounds):
+    """all_gather the column strips [bounds[r], bounds[r+1]) of the last dim held by each rank."""
+    wmax = max(b - a for a, b in zip(bounds, bounds[1:]))
+    t = F.pad(t, (0, wmax - t.shape[-1])).contiguous()
+    parts = [torch.empty_like(t) for _ in range(len(bounds) - 1)]
+    dist.all_gather(parts, t)
+    return torch.cat([p[..., : b - a] for p, a, b in zip(parts, bounds, bounds[1:])], -1)
+
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -216,7 +264,23 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
     idxs = get_frame_indices(frame_num, video_fps, target_num, fps)
 
     frames = video_reader.get_batch(idxs).asnumpy()
-    cond_images = [resize_by_area(frame, width * height, divisor=16) for frame in frames]
+    split_vae = os.environ.get("WAN_SPLIT_VAE") == "1" and dist.get_world_size() > 1
+    if split_vae:
+        # resizing 400 1080p frames takes ~15 s on CPU; each rank resizes a share and the
+        # results are exchanged over NCCL
+        world, rank = dist.get_world_size(), dist.get_rank()
+        per = -(-len(frames) // world)
+        mine = [resize_by_area(f, width * height, divisor=16) for f in frames[rank * per:(rank + 1) * per]]
+        shape = resize_by_area(frames[0], width * height, divisor=16).shape
+        buf = torch.zeros(per, *shape, dtype=torch.uint8, device=device)
+        if mine:
+            buf[:len(mine)] = torch.from_numpy(np.stack(mine)).to(device)
+        parts = [torch.empty_like(buf) for _ in range(world)]
+        dist.all_gather(parts, buf)
+        cond_images = list(torch.cat(parts)[:len(frames)].cpu().numpy())
+        del buf, parts, mine
+    else:
+        cond_images = [resize_by_area(frame, width * height, divisor=16) for frame in frames]
     real_frame_len = len(frames)
 
     logger.info('real_frame_len: {}'.format(real_frame_len))
@@ -224,6 +288,39 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
 
     logger.info('target_len: {}'.format(target_len))
     cond_images = zigzag_padding(cond_images, target_len)
+
+    # v3 (WAN_PRECOMPUTE=1): encode the driving video once up front, windows split
+    # round-robin across ranks (the VAE is replicated, so ranks encode in parallel)
+    # and broadcast, instead of every rank re-encoding every window. Per-video constants
+    # (reference latent/CLIP features, T5 prompts) are computed once in the first window.
+    precompute = os.environ.get("WAN_PRECOMPUTE") == "1"
+    cond_cache, const_cache = {}, {}
+    if precompute:
+        windows, s_, e_, clip_ = [], 0, CLIP_LEN, CLIP_LEN
+        while s_ + first_num < len(cond_images):
+            if len(cond_images) - s_ < clip_:
+                clip_ = len(cond_images) - s_
+            windows.append((s_, e_))
+            s_ += clip_ - first_num
+            e_ += clip_ - first_num
+        world, rank = dist.get_world_size(), dist.get_rank()
+        ch, cw = cond_images[0].shape[:2]
+        torch.cuda.synchronize(); t_pre = time.time()
+        with torch.autocast(device_type=str(device), dtype=torch.bfloat16), torch.no_grad():
+            for w, (s_, e_) in enumerate(windows):
+                n = len(cond_images[s_:e_])
+                if w % world == rank:
+                    x = rearrange(torch.tensor(np.stack(cond_images[s_:e_]) / 127.5 - 1),
+                                  "t h w c -> 1 c t h w").to(device=device, dtype=torch.bfloat16)
+                    cond_cache[w] = torch.stack(vae.encode(x)).float().contiguous()
+                    del x
+                else:
+                    cond_cache[w] = torch.empty(1, 16, (n - 1) // 4 + 1, ch // 8, cw // 8,
+                                                device=device, dtype=torch.float32)
+        for w in range(len(windows)):
+            dist.broadcast(cond_cache[w], src=w % world)
+        torch.cuda.synchronize()
+        logger.info(f"[GPU {gpu}] precomputed {len(windows)} driving-video windows in {time.time() - t_pre:.1f}s")
 
     torch.cuda.empty_cache()
     idex = 0
@@ -247,10 +344,17 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
             "refer_t_pixel_values": torch.zeros(first_num, 3, height, width),
         }
        
-        batch["conditioning_pixel_values"] = rearrange(
-            torch.tensor(np.stack(cond_images[start:end]) / 127.5 - 1),
-            "t h w c -> 1 c t h w",
-        )
+        if precompute:
+            # the window's latents are precomputed; only its first frame is still used (CLIP)
+            batch["conditioning_pixel_values"] = rearrange(
+                torch.tensor(cond_images[start][None] / 127.5 - 1),
+                "t h w c -> 1 c t h w",
+            )
+        else:
+            batch["conditioning_pixel_values"] = rearrange(
+                torch.tensor(np.stack(cond_images[start:end]) / 127.5 - 1),
+                "t h w c -> 1 c t h w",
+            )
 
         batch["refer_pixel_values"] = rearrange(
             torch.tensor(first_img / 127.5 - 1), "h w c -> 1 c h w"
@@ -296,6 +400,7 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
         ]
 
         torch.cuda.empty_cache()
+        torch.cuda.synchronize(); t_window = time.time()
 
         with (
             torch.autocast(device_type=str(device), dtype=torch.bfloat16, enabled=True),
@@ -313,76 +418,91 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
             latents = noise
 
             ref_pixel_values = rearrange(ref_pixel_values, "t c h w -> 1 c t h w")
-            ref_latents = vae.encode(ref_pixel_values.to(torch.bfloat16))
-            ref_latents = torch.stack(ref_latents)
+            if "ref_latents" in const_cache:
+                ref_latents = const_cache["ref_latents"]
+            else:
+                ref_latents = torch.stack(vae.encode(ref_pixel_values.to(torch.bfloat16)))
+                if precompute:
+                    const_cache["ref_latents"] = ref_latents
             mask_ref = get_i2v_mask(1, lat_h, lat_w, 1, device=device)
             y_ref = torch.concat([mask_ref, ref_latents[0]]).to(dtype=torch.bfloat16, device=device)
 
+            if os.environ.get("WAN_MEMLOG") and gpu == 0:
+                print(f"[memlog] after_ref_vae: allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
             img = ref_pixel_values[0, :, 0]
-            clip_context = clip.visual([img[:, None, :, :]]).to(dtype=torch.bfloat16, device=device)
+            if "clip_context" in const_cache:
+                clip_context = const_cache["clip_context"]
+            else:
+                clip_context = clip.visual([img[:, None, :, :]]).to(dtype=torch.bfloat16, device=device)
+                if precompute:
+                    const_cache["clip_context"] = clip_context
 
             msk_reft = get_i2v_mask(lat_t - 1, lat_h, lat_w, mask_reft_len, device=device)
 
             if mask_reft_len > 0:
-                y_reft = vae.encode(
+                y_reft_in = torch.concat(
                     [
-                        torch.concat(
-                            [
-                                torch.nn.functional.interpolate(batch["pixel_values"][0, :, :mask_reft_len].cpu(),
-                                                                size=(H, W), mode="bicubic"),
-                                torch.zeros(3, T - mask_reft_len - 1, H, W),
-                            ],
-                            dim=1,
-                        ).to(device)
-                    ]
-                )[0]
+                        torch.nn.functional.interpolate(batch["pixel_values"][0, :, :mask_reft_len].cpu(),
+                                                        size=(H, W), mode="bicubic"),
+                        torch.zeros(3, T - mask_reft_len - 1, H, W),
+                    ],
+                    dim=1,
+                ).to(device)
             else:
-                y_reft = vae.encode(
+                y_reft_in = torch.concat(
                     [
-                        torch.concat(
-                            [
-                                torch.zeros(3, T - mask_reft_len - 1, H, W),
-                            ],
-                            dim=1,
-                        ).to(device)
-                    ]
-                )[0]
+                        torch.zeros(3, T - mask_reft_len - 1, H, W),
+                    ],
+                    dim=1,
+                ).to(device)
+            if split_vae:
+                world, rank = dist.get_world_size(), dist.get_rank()
+                bounds = _col_bounds(W // 8, world)
+                y_reft = vae.encode_cols(y_reft_in, bounds[rank], bounds[rank + 1],
+                                         lambda h: _gather_cols(h, bounds), halo=VAE_HALO)
+            else:
+                y_reft = vae.encode([y_reft_in])[0]
+            del y_reft_in
 
             y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=device)
             y = torch.concat([y_ref, y_reft], dim=1)
 
-            condition_latents = vae.encode(conditioning_pixel_values.to(torch.bfloat16))
-            condition_latents = torch.stack(condition_latents)
-            condition_latents = torch.cat([condition_latents], dim=2)
+            if precompute:
+                condition_latents = cond_cache.pop(idex - 1)
+            else:
+                condition_latents = vae.encode(conditioning_pixel_values.to(torch.bfloat16))
+                condition_latents = torch.stack(condition_latents)
+                condition_latents = torch.cat([condition_latents], dim=2)
 
             B, C, T, H, W = conditioning_pixel_values.shape
+            if precompute:
+                T = len(cond_images[start:end])
             B, C, lat_t, lat_h, lat_w = condition_latents.shape
             grid_sizes_ref = torch.stack([torch.tensor([lat_t, lat_h // 2, lat_w // 2], dtype=torch.long)])
 
+            if os.environ.get("WAN_MEMLOG") and gpu == 0:
+                print(f"[memlog] after_cond_vae: allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
             condition_img =  batch["conditioning_pixel_values"][0, :, 0]
             condition_clip_context = clip.visual([condition_img[:, None, :, :]]).to(dtype=torch.bfloat16, device=device)
             
             mask_len = T
-            condition_y = vae.encode(
-                [
-                    torch.concat(
-                        [
-                            torch.nn.functional.interpolate(batch["conditioning_pixel_values"][0, :, :mask_len].cpu(),
-                                                            size=(H, W), mode="bicubic"),
-                            torch.zeros(3, T - mask_len, H, W),
-                        ],
-                        dim=1,
-                    ).to(device)
-                ]
-            )[0]
+            # With mask_len == T this would re-encode exactly the conditioning frames
+            # (same-size bicubic resize is the identity and no zero frames are appended),
+            # so reuse the latents computed above instead of a second VAE pass.
+            condition_y = condition_latents[0]
 
             condition_msk_y = get_i2v_mask(lat_t, lat_h, lat_w, mask_len, device=device)
             condition_y = torch.concat([condition_msk_y, condition_y]).to(dtype=torch.bfloat16, device=device)
             
             if use_t5:
-                logger.info('prompt:{}'.format(prompt))
-                context = t5(prompt)[0]
-                context_ref = t5(prompt_ref)[0]
+                if "context" in const_cache:
+                    context, context_ref = const_cache["context"], const_cache["context_ref"]
+                else:
+                    logger.info('prompt:{}'.format(prompt))
+                    context = t5(prompt)[0]
+                    context_ref = t5(prompt_ref)[0]
+                    if precompute:
+                        const_cache["context"], const_cache["context_ref"] = context, context_ref
 
             max_seq_len = int(math.ceil(np.prod(target_shape) // 4 / cfg.test_cfg.sp_size)) * cfg.test_cfg.sp_size
             target_ref_shape = condition_latents.shape[2:]
@@ -429,6 +549,9 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
             t = timesteps[0]
             timestep = [t]
             timestep = torch.stack(timestep)
+            if os.environ.get("WAN_MEMLOG") and gpu == 0:
+                print(f"[memlog] before_forward_ref: allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
+            torch.cuda.synchronize(); t_denoise = time.time()
             model(condition_latents, grid_sizes=grid_sizes, k_cache=k_cache, v_cache=v_cache, t=timestep,  method='forward_ref', **arg_ref_c)
             for i, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
@@ -436,9 +559,17 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
 
                 timestep = torch.stack(timestep)
 
+                profile = os.environ.get("WAN_PROFILE") == "1" and gpu == 0 and idex == 2 and i == 3
+                if profile:
+                    prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+                    prof.__enter__()
                 noise_pred_cond = TensorList(
                     model(TensorList(latent_model_input), k_cache=k_cache, v_cache=v_cache, t=timestep, grid_sizes_ref=grid_sizes_ref, method='forward_gen', **arg_c)
                 )
+                if profile:
+                    torch.cuda.synchronize()
+                    prof.__exit__(None, None, None)
+                    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=45), flush=True)
 
                 if cfg.test_cfg.sample_guide_scale > 1:
                     noise_pred_uncond = TensorList(
@@ -461,11 +592,52 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                 )[0]
                 latents[0] = temp_x0.squeeze(0)
 
+            torch.cuda.synchronize(); t_decode = time.time()
+            # The reference K/V cache (~17 GB/GPU at 1080p) is not needed for decoding
+            del k_cache, v_cache
+            torch.cuda.empty_cache()
             x0 = latents
             # 将latents转换为float32进行解码
             x0 = [x.to(dtype=torch.float32) for x in x0]
             torch.cuda.empty_cache()
-            out_frames = torch.stack(vae.decode([x0[0][:, 1:]]))
+            if split_vae:
+                world, rank = dist.get_world_size(), dist.get_rank()
+                bounds = _col_bounds(x0[0].shape[-1], world)
+                strip = vae.decode_cols(x0[0][:, 1:], bounds[rank], bounds[rank + 1], halo=VAE_HALO)
+                out_frames = _gather_cols(strip, [8 * b for b in bounds])[None]
+                del strip
+            else:
+                out_frames = torch.stack(vae.decode([x0[0][:, 1:]]))
+
+            anchor_mode = item.anchor_mode if item.color_anchor else "off"
+            if start == 0:
+                # The first decoded frame comes out with wrong colors; replace it with
+                # its neighbor and take the color/detail reference from the clean frames.
+                out_frames[0, :, 0] = out_frames[0, :, 1]
+                if anchor_mode == "person":
+                    w0 = out_frames[0, :, 1:]
+                    color_target = person_stats(w0, person_mask(w0))
+                elif anchor_mode == "regions":
+                    w0 = out_frames[0, :, 1:]
+                    color_target = region_stats(w0, person_mask(w0))
+                else:
+                    color_target = lab_mean(out_frames[0, :, 1:])
+            elif anchor_mode == "person":
+                out_frames[0], info = anchor_person(out_frames[0], color_target)
+                logger.info(f"[GPU {gpu}] window {idex} person anchor: shift (dL, da, db) "
+                            f"{[round(v, 2) for v in info['shift']]}, detail gain {info['detail_gain']:.3f}")
+            elif anchor_mode == "regions":
+                out_frames[0], info = anchor_regions(out_frames[0], color_target)
+                logger.info(f"[GPU {gpu}] window {idex} region anchor: " + ", ".join(
+                    f"{k} shift {[round(v, 2) for v in d['shift']]} detail {d['detail_gain']:.3f}" for k, d in info.items()))
+            elif anchor_mode == "global":
+                out_frames[0], drift = anchor_window_color(out_frames[0], color_target)
+                logger.info(f"[GPU {gpu}] window {idex} color drift corrected (dL, da, db): "
+                            f"{[round(v, 2) for v in drift.tolist()]}")
+            if anchor_mode != "off" and dist.get_world_size() > 1:
+                # every rank must condition the next window on identical pixels
+                out_frames = out_frames.contiguous()
+                dist.broadcast(out_frames, src=0)
 
             out = (
                 rearrange(((out_frames + 1) * 127.5), "1 c t h w -> t h w c")
@@ -480,6 +652,10 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                 out = out[first_num:]
 
             all_out_frames.extend([*out])
+            if gpu == 0:
+                torch.cuda.synchronize(); t_end = time.time()
+                logger.info(f"[timing] window {idex}: prep/encode {t_denoise - t_window:.1f}s, "
+                            f"denoise {t_decode - t_denoise:.1f}s, decode/post {t_end - t_decode:.1f}s")
             start += CLIP_LEN - first_num
             end += CLIP_LEN - first_num
             torch.cuda.empty_cache()
@@ -496,9 +672,7 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
             all_out_frames_array = all_out_frames_array[:, padding:padding+side_long, :, :]
 
         video_path = os.path.join(output_path, 'results.mp4')
-        mpy.ImageSequenceClip([*all_out_frames_array], fps=fps).write_videofile(
-            video_path
-        )
+        write_video(all_out_frames_array, video_path, fps)
         if os.path.exists(audio_save_path):
             merge_video_audio(video_path, audio_save_path)
 
@@ -689,6 +863,8 @@ def worker(gpu, cfg, in_q_list, out_q, initialized_events):
         
         # init done
         logger.info(f'[GPU {gpu}] Worker initialization completed')
+        if os.environ.get("WAN_MEMLOG") and gpu == 0:
+            print(f"[memlog] after init: allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
         event.set()
 
         # start inference
@@ -801,6 +977,8 @@ class WanAnimate2MPIPipeline(BaseInferencePipeline):
         seed=-1, clip_len=81, sample_guide_scale=1.0, step=10,
         prompt=['视频中的人在做动作， 背景静止'],
         prompt_ref=['视频中的人在做动作， 背景静止'],
+        color_anchor=True,
+        anchor_mode="regions",
         neg_prompt=['过曝，静态，细节模糊不清，字幕，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，三条腿']
     ):
         if seed == -1:
@@ -824,6 +1002,8 @@ class WanAnimate2MPIPipeline(BaseInferencePipeline):
                 "step": step,
                 "prompt": prompt,
                 "prompt_ref": prompt_ref,
+                "color_anchor": color_anchor,
+                "anchor_mode": anchor_mode,
                 "neg_prompt": neg_prompt
             }
         )
