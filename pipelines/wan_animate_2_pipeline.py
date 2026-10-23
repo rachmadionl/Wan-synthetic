@@ -553,6 +553,9 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                 print(f"[memlog] before_forward_ref: allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
             torch.cuda.synchronize(); t_denoise = time.time()
             model(condition_latents, grid_sizes=grid_sizes, k_cache=k_cache, v_cache=v_cache, t=timestep,  method='forward_ref', **arg_ref_c)
+            # WAN_CFG_STEPS=n: apply CFG only on the first n steps (expression/structure is
+            # set early), the rest run cond-only; unset = CFG on every step
+            cfg_steps = int(os.environ.get("WAN_CFG_STEPS", len(timesteps)))
             for i, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
@@ -571,7 +574,7 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                     prof.__exit__(None, None, None)
                     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=45), flush=True)
 
-                if cfg.test_cfg.sample_guide_scale > 1:
+                if cfg.test_cfg.sample_guide_scale > 1 and i < cfg_steps:
                     noise_pred_uncond = TensorList(
                         model(
                             TensorList(latent_model_input), k_cache=k_cache, v_cache=v_cache, t=timestep, grid_sizes_ref=grid_sizes_ref, method='forward_gen', **arg_null

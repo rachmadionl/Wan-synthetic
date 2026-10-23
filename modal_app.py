@@ -197,7 +197,7 @@ def download_weights(force: bool = False):
 @app.cls(
     gpu=GPU,
     # pass-through switches for A/B tests and profiling (read when the app is launched)
-    env={k: os.environ[k] for k in ("WAN_ATTN", "WAN_PROFILE", "WAN_LOG_SCALE", "WAN_MEMLOG", "WAN_PRECOMPUTE", "WAN_SPLIT_VAE") if k in os.environ},
+    env={k: os.environ[k] for k in ("WAN_ATTN", "WAN_PROFILE", "WAN_LOG_SCALE", "WAN_MEMLOG", "WAN_PRECOMPUTE", "WAN_SPLIT_VAE", "WAN_CFG_STEPS") if k in os.environ},
     volumes={CKPT_DIR: ckpt_volume, "/root/.cache": cache_volume},
     # rank 0 materializes the full 33 GB state dict in host RAM, and every rank
     # loads T5 (11 GB) on CPU before sharding.
@@ -254,6 +254,7 @@ class WanAnimate2:
         guide_scale: float = 1.0,
         seed: int = -1,
         prompt_ref: str = "人物动作的参考视频",
+        neg_prompt: str = "",
         color_anchor: bool = True,
         anchor_mode: str = "regions",
     ) -> bytes:
@@ -282,6 +283,7 @@ class WanAnimate2:
             step=step,
             prompt=prompt,
             prompt_ref=prompt_ref,
+            **({"neg_prompt": [neg_prompt]} if neg_prompt else {}),
             color_anchor=color_anchor,
             anchor_mode=anchor_mode,
         )
@@ -374,6 +376,9 @@ def batch(
     anchor_mode: str = "regions",
     final_size: str = "",
     steps: int = 0,
+    prompt_ref: str = "人物动作的参考视频",
+    guide_scale: float = -1.0,
+    neg_prompt: str = "",
 ):
     """Animate every reference image in --frames-dir with one driving video.
 
@@ -414,7 +419,8 @@ def batch(
 
     driving_bytes = Path(driving).read_bytes()
     step = steps or (10 if variant == "distillation" else 40)
-    guide_scale = 1.0 if variant == "distillation" else 3.0
+    if guide_scale < 0:
+        guide_scale = 1.0 if variant == "distillation" else 3.0
     model = WanAnimate2.with_options(max_containers=max_containers)(variant=variant)
 
     calls = {
@@ -422,6 +428,7 @@ def batch(
             refer_img=p.read_bytes(), refer_video=driving_bytes, prompt=prompts[p.stem],
             width=width, height=height, fps=fps, step=step, guide_scale=guide_scale, seed=seed,
             color_anchor=color_anchor, clip_len=clip_len, anchor_mode=anchor_mode,
+            prompt_ref=prompt_ref, neg_prompt=neg_prompt,
         )
         for p in todo
     }
@@ -441,7 +448,12 @@ def batch(
             w, h = final_size.split("x")
             subprocess.run(
                 ["ffmpeg", "-v", "error", "-y", "-i", str(raw_dir / f"{name}.mp4"),
-                 "-vf", f"scale={w}:{h}:flags=lanczos", "-c:v", "libx264", "-crf", "14",
+                 # The raw generation is untagged BT.601 (ffmpeg's rgb24->yuv default); players
+                 # assume BT.709 for HD, which shifts skin tones. Convert to BT.709 and tag it.
+                 "-vf", f"scale={w}:{h}:flags=lanczos:in_color_matrix=bt601:in_range=tv:"
+                        "out_color_matrix=bt709:out_range=tv,"
+                        "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                 "-c:v", "libx264", "-crf", "14",
                  "-preset", "slow", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
                  str(out / f"{name}{final_suffix}.mp4")],
                 check=True,
